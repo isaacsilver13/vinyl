@@ -32,14 +32,14 @@ jobs:
 
       - name: Validate Fly.io authentication
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_WEB }}
         run: |
           test -n "$FLY_API_TOKEN" || { echo "FLY_API_TOKEN is not configured."; exit 1; }
           flyctl auth whoami
 
       - name: Start Fly machine for refresh
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_WEB }}
         run: |
           set -euo pipefail
 
@@ -63,7 +63,7 @@ jobs:
 
       - name: Run refresh via Fly.io SSH
         env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_WEB }}
         run: |
           # SSH into the running machine and run the refresh script
           flyctl ssh console \
