@@ -87,6 +87,41 @@ def test_repeat_bulk_post_upserts_instead_of_duplicating(client, monkeypatch):
     assert rows[0].price == 20.0
 
 
+def test_health_ready(client):
+    response = client.get("/health/ready")
+    assert response.status_code == 200
+    assert response.json()["database"] == "healthy"
+
+
+def test_health_metrics_reports_counts(client):
+    response = client.get("/health/metrics")
+    assert response.status_code == 200
+    assert "listing_count" in response.json()
+    assert "play_count" in response.json()
+
+
+def test_health_metrics_reflects_activity(client, monkeypatch):
+    monkeypatch.delenv("VINYL_API_KEY", raising=False)
+    before = client.get("/health/metrics").json()["listing_count"]
+    unique_payload = {
+        "release_id": 999,
+        "listings": [{"listing_id": "health-metrics-test", "price": 1.0, "currency": "USD"}],
+    }
+    client.post("/listings/bulk", json=unique_payload)
+
+    response = client.get("/health/metrics")
+
+    assert response.status_code == 200
+    assert response.json()["listing_count"] == before + 1
+    assert response.json()["data_freshness_at"] is not None
+
+
+def test_health_errors_returns_a_list(client):
+    response = client.get("/health/errors")
+    assert response.status_code == 200
+    assert response.json()["errors"] == []
+
+
 def test_non_local_env_refuses_to_start_without_key(monkeypatch):
     import asyncio
 

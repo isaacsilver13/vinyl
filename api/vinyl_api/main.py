@@ -4,8 +4,12 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Header, HTTPException
 from typing import Optional
 from . import database, models, schemas
+from .error_log import install as install_error_log, recent_errors
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 from datetime import datetime, timezone
+
+install_error_log()
 
 
 @asynccontextmanager
@@ -40,6 +44,39 @@ def require_api_key(authorization: Optional[str] = Header(default=None)) -> None
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/health/ready")
+def health_ready() -> dict[str, str]:
+    db: Session = database.SessionLocal()
+    try:
+        db.execute(text("SELECT 1"))
+    finally:
+        db.close()
+    return {"status": "ok", "database": "healthy"}
+
+
+@app.get("/health/metrics")
+def health_metrics() -> dict[str, object]:
+    db: Session = database.SessionLocal()
+    try:
+        last_listing_sync = db.query(func.max(models.Listing.last_fetched)).scalar()
+        last_play_logged = db.query(func.max(models.Play.played_at)).scalar()
+        listing_count = db.query(func.count(models.Listing.id)).scalar()
+        play_count = db.query(func.count(models.Play.id)).scalar()
+    finally:
+        db.close()
+    return {
+        "last_activity_at": last_play_logged,
+        "data_freshness_at": last_listing_sync,
+        "listing_count": listing_count,
+        "play_count": play_count,
+    }
+
+
+@app.get("/health/errors")
+def health_errors() -> dict[str, object]:
+    return {"errors": recent_errors()}
 
 
 @app.post("/listings/bulk", dependencies=[Depends(require_api_key)])
