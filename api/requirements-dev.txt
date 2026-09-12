@@ -1,0 +1,3 @@
+-r vinyl_api/requirements.txt
+pytest
+httpx

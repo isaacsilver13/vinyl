@@ -1,0 +1,72 @@
+name: Vinyl App Daily Discogs Refresh
+
+on:
+  schedule:
+    - cron: "0 8 * * *"   # 08:00 UTC (4 AM ET / 1 AM PT) every day
+  workflow_dispatch:        # allow manual trigger from GitHub Actions UI
+
+defaults:
+  run:
+    working-directory: app
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: app/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Set up Flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Validate Fly.io authentication
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          test -n "$FLY_API_TOKEN" || { echo "FLY_API_TOKEN is not configured."; exit 1; }
+          flyctl auth whoami
+
+      - name: Start Fly machine for refresh
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          machine_json="$(flyctl machine list --app vinyl-catalog --json)"
+          machine_id="$(jq -r '.[0].id // empty' <<< "$machine_json")"
+          machine_state="$(jq -r '.[0].state // empty' <<< "$machine_json")"
+
+          if [ -z "$machine_id" ]; then
+            echo "No Fly machine found for vinyl-catalog."
+            exit 1
+          fi
+
+          echo "Using Fly machine $machine_id (state: $machine_state)."
+          if [ "$machine_state" != "started" ]; then
+            flyctl machine start "$machine_id" --app vinyl-catalog
+          fi
+          flyctl machine wait "$machine_id" \
+            --app vinyl-catalog \
+            --state started \
+            --wait-timeout 5m
+
+      - name: Run refresh via Fly.io SSH
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          # SSH into the running machine and run the refresh script
+          flyctl ssh console \
+            --app vinyl-catalog \
+            --command "python /app/refresh_all.py --force" \
+            --quiet

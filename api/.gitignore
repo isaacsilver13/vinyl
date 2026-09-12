@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Environment and secrets
+.env
+*.env
+
+# Local databases and runtime data
+*.db
+*.db-shm
+*.db-wal
+/data/
+
+# Test and tooling caches
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# OS/editor
+.vscode/
+.DS_Store
+Thumbs.db
