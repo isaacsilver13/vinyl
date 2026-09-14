@@ -1,11 +1,14 @@
 # See https://fly.io/docs/app-guides/continuous-deployment-with-github-actions/
+#
+# Deploying is a deliberate, manual action: pushing to main no longer
+# triggers a deploy by itself (app/ has no CI workflow to gate on either).
+# Trigger a deploy from the Actions tab ("Run workflow") or
+# `gh workflow run app-deploy.yml`.
 
 name: Vinyl App Fly Deploy
 
 on:
-  push:
-    branches: [main]
-    paths: ['app/**']
+  workflow_dispatch:
 
 defaults:
   run:

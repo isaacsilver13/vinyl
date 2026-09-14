@@ -1,17 +1,11 @@
 name: Vinyl API Fly Deploy
 
-# Deploy is gated on Vinyl API CI (api-ci.yml) succeeding: this workflow no
-# longer triggers on push directly (a broken test suite would otherwise
-# still deploy), and instead triggers when the CI workflow finishes running
-# on main. `workflow_run` doesn't support `paths:` filtering, but that's
-# fine here -- api-ci.yml is already scoped to `paths: ['api/**']`, so it
-# (and therefore this deploy) only runs/succeeds for pushes that touch
-# api/**.
+# Deploying is a deliberate, manual action: pushing to main (even once CI
+# has passed) no longer triggers a deploy by itself. Trigger a deploy from
+# the Actions tab ("Run workflow") or `gh workflow run api-deploy.yml`,
+# after confirming Vinyl API CI (api-ci.yml) is green for the commit you
+# want to ship.
 on:
-  workflow_run:
-    workflows: ["Vinyl API CI"]
-    types: [completed]
-    branches: [main]
   workflow_dispatch:
 
 defaults:
@@ -23,11 +17,8 @@ jobs:
     name: Deploy API
     runs-on: ubuntu-latest
     concurrency: deploy-vinyl-api
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Deploy to Fly.io
         run: flyctl deploy --config fly.toml --remote-only

@@ -42,6 +42,7 @@ jobs:
           flyctl auth whoami
 
       - name: Start Fly machine for refresh
+        id: start_machine
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_WEB }}
         run: |
@@ -65,22 +66,31 @@ jobs:
             --state started \
             --wait-timeout 5m
 
-      - name: Run refresh via Fly.io SSH
+          echo "machine_id=$machine_id" >> "$GITHUB_OUTPUT"
+
+      - name: Run refresh via Fly.io machine exec
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_WEB }}
         run: |
-          # SSH into the running machine and run the refresh script.
-          # `flyctl ssh console` gives a root shell, but the app itself (and
-          # /data's ownership, per app/entrypoint.sh) runs as the unprivileged
-          # appuser -- running this as root would leave any file it writes in
-          # /data root-owned, which appuser then can't write to until the
-          # next restart re-runs entrypoint.sh's chown. setpriv (same
-          # mechanism entrypoint.sh uses to drop privileges) keeps this
-          # consistent instead of introducing a separate su-based path.
-          flyctl ssh console \
+          # `flyctl ssh console` proxies an interactive shell through
+          # flyctl's own userland WireGuard tunnel, which has documented
+          # community reports of dropping long-held sessions with exactly
+          # the error seen on the last two scheduled runs here ("ssh shell:
+          # wait: remote command exited without exit status or exit
+          # signal", 5-7 minutes in, with refresh_all.py still healthy per
+          # its own logs). `flyctl machine exec` runs the command through
+          # the Machines API's exec mechanism instead of that SSH proxy and
+          # takes its own explicit --timeout, so it isn't subject to the
+          # same tunnel session-durability limits. 1800s (30m) gives
+          # headroom well beyond the ~6-8 minute refresh observed so far.
+          #
+          # Same setpriv rationale as before: the machine's default exec
+          # user is root, but /data is owned by appuser (per
+          # app/entrypoint.sh), so this drops privileges the same way.
+          flyctl machine exec "${{ steps.start_machine.outputs.machine_id }}" \
+            "setpriv --reuid=appuser --regid=appuser --init-groups python /app/refresh_all.py --force" \
             --app vinyl-catalog \
-            --command "setpriv --reuid=appuser --regid=appuser --init-groups python /app/refresh_all.py --force" \
-            --quiet
+            --timeout 1800
 
       - name: Notify on failure
         if: failure()
