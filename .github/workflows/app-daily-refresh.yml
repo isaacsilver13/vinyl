@@ -81,8 +81,10 @@ jobs:
           # its own logs). `flyctl machine exec` runs the command through
           # the Machines API's exec mechanism instead of that SSH proxy and
           # takes its own explicit --timeout, so it isn't subject to the
-          # same tunnel session-durability limits. 1800s (30m) gives
-          # headroom well beyond the ~6-8 minute refresh observed so far.
+          # same tunnel session-durability limits. 600s (10m) is the max
+          # the Machines API allows for a single exec (a larger value is
+          # rejected outright: "timeout must not exceed 600 seconds") --
+          # this is a hard ceiling, not a tuning choice.
           #
           # Same setpriv rationale as before: the machine's default exec
           # user is root, but /data is owned by appuser (per
@@ -90,7 +92,7 @@ jobs:
           flyctl machine exec "${{ steps.start_machine.outputs.machine_id }}" \
             "setpriv --reuid=appuser --regid=appuser --init-groups python /app/refresh_all.py --force" \
             --app vinyl-catalog \
-            --timeout 1800
+            --timeout 600
 
       - name: Notify on failure
         if: failure()
