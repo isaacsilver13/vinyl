@@ -32,3 +32,5 @@ streamlit run app.py
 ```
 
 Production `app/` uses `https://vinyl-api.fly.dev` for `VINYL_API_URL` and the same secret value for `VINYL_API_KEY` on both Fly applications.
+
+See [`CHANGELOG.md`](CHANGELOG.md) for notable fixes/changes to either service.
