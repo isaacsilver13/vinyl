@@ -1,4 +1,8 @@
-"""Run the Vinyl refresh and alert jobs from any working directory."""
+"""Run the Vinyl daily refresh job from any working directory.
+
+Mirrors the production cron (see .github/workflows/app-daily-refresh.yml),
+which runs `refresh_all.py --force` and lets it send alert emails inline.
+"""
 from __future__ import annotations
 
 import os
@@ -18,6 +22,5 @@ def run(script: Path, *args: str) -> None:
 
 
 if __name__ == "__main__":
-    run(ROOT / "refresh_all.py", "--force", "--no-alerts")
-    run(ROOT / "send_listing_alerts.py")
-    print("Daily refresh + alerts completed.")
+    run(ROOT / "refresh_all.py", "--force")
+    print("Daily refresh completed.")

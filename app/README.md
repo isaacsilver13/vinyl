@@ -28,20 +28,38 @@ For the deployed app, set `VINYL_API_URL` to `https://vinyl-api.fly.dev` and set
 
 ## Refresh jobs
 
-Run a complete refresh and alert cycle from any working directory:
+Run the daily refresh (collection/wantlist/suggestions/listings sync, with alert emails sent inline) from any working directory:
 
 ```powershell
 python scripts/daily_refresh_and_alerts.py
 ```
 
-The Windows-only wrapper is available at `scripts/run_daily_refresh.ps1`. Set `PROJECT_ROOT` when invoking the scripts from a separate scheduler.
+This mirrors production: it calls `refresh_all.py --force`, which handles alert-sending itself. The Windows-only wrapper is available at `scripts/run_daily_refresh.ps1`. Set `PROJECT_ROOT` when invoking the scripts from a separate scheduler.
 
 ## Deployment
 
-The Streamlit Fly.io application is `vinyl-catalog`. Its deployment configuration is in `fly.toml` and uses the `vinyl_data` persistent volume mounted at `/data`.
+The Streamlit Fly.io application is `vinyl-catalog`. Its deployment configuration is in `fly.toml` and uses the `vinyl_data` persistent volume mounted at `/data`. The container's `entrypoint.sh` fixes `/data`'s ownership at every start (a Fly volume mount can arrive root-owned regardless of what the image sets at build time) before dropping to the unprivileged `appuser` the app actually runs as.
 
 ```powershell
 fly deploy
 ```
 
-Set Discogs, SMTP, registration, and API credentials through Fly secrets. Never commit `.env` files, database files, or tokens.
+Set the following through Fly secrets (never commit `.env` files, database files, or tokens):
+
+- `DISCOGS_TOKEN` — Discogs personal access token
+- `DISCOGS_USERNAME` — Discogs account username
+- `REGISTRATION_CODE` — invite code required to create a new account via the web UI
+- `VINYL_API_KEY` — must match the key set on the `vinyl-api` Fly app
+- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `ALERT_FROM_EMAIL` — SMTP delivery for listing-alert digest emails
+
+Optional, only needed if the corresponding feature is used:
+
+- `DISCOGS_APP_NAME` — custom User-Agent string sent to Discogs (defaults to `VinylCatalogApp/1.0`)
+- `SMTP_USE_TLS`, `ALERT_FROM_NAME`, `SMTP_DEBUG` — additional SMTP tuning
+- `SPOTIFY_CLIENT_ID`, `SPOTIFY_REDIRECT_URI` — Spotify integration
+
+`VINYL_API_URL` is already set as a plain (non-secret) `[env]` value in `fly.toml` and does not need to be set via `fly secrets set`.
+
+```powershell
+fly secrets set DISCOGS_TOKEN=... DISCOGS_USERNAME=... REGISTRATION_CODE=... VINYL_API_KEY=... SMTP_HOST=... SMTP_PORT=... SMTP_USERNAME=... SMTP_PASSWORD=... ALERT_FROM_EMAIL=... -a vinyl-catalog
+```

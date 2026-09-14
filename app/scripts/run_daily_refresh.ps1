@@ -6,7 +6,12 @@ param(
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$VinylDir = Resolve-Path (Join-Path $ScriptDir "..")
+if ([string]::IsNullOrEmpty($env:PROJECT_ROOT)) {
+    $VinylDir = Resolve-Path (Join-Path $ScriptDir "..")
+}
+else {
+    $VinylDir = Resolve-Path $env:PROJECT_ROOT
+}
 
 Push-Location $VinylDir
 try {

@@ -22,6 +22,9 @@ venv/
 .venv/
 env/
 
+# Node
+node_modules/
+
 # VS Code
 .vscode/
 

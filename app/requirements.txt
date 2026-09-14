@@ -1,9 +1,14 @@
-streamlit>=1.35.0
-python3-discogs-client>=2.8
-python-dotenv>=1.0.0
-pandas>=2.0.0
-cloudscraper>=1.2.71
-beautifulsoup4>=4.12
-streamlit-aggrid>=0.3.4
-plotly>=5.0.0
-bcrypt>=4.0.0
+streamlit==1.63.0
+python3-discogs-client==2.9
+python-dotenv==1.2.3
+pandas==3.0.5
+cloudscraper==1.2.71
+beautifulsoup4==4.15.0
+streamlit-aggrid==1.2.1.post2
+plotly==7.0.0
+bcrypt==5.0.0
+# requests is imported directly by vinyl_api_client.py and discogs_api.py; it
+# previously only arrived transitively via cloudscraper/python3-discogs-client
+# and floated unpinned. Pin it explicitly -- version matches what actually
+# resolves in the built image, and matches api/vinyl_api/requirements.txt.
+requests==2.34.2

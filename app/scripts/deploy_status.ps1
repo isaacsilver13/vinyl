@@ -14,7 +14,6 @@ if ($StatusOnly -and $Deploy) {
 }
 
 $AppRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$ApiRoot = (Resolve-Path (Join-Path $AppRoot "..\vinyl_api")).Path
 
 $Targets = @{
     app = @{
@@ -23,7 +22,11 @@ $Targets = @{
         Config = Join-Path $AppRoot "fly.toml"
         HealthUrl = "https://vinyl-catalog.fly.dev/"
     }
-    api = @{
+}
+
+if ($Service -eq "api" -or $Service -eq "both") {
+    $ApiRoot = (Resolve-Path (Join-Path $AppRoot "..\api")).Path
+    $Targets["api"] = @{
         Name = "vinyl-api"
         Root = $ApiRoot
         Config = Join-Path $ApiRoot "fly.toml"

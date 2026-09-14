@@ -5,6 +5,10 @@ on:
     - cron: "0 8 * * *"   # 08:00 UTC (4 AM ET / 1 AM PT) every day
   workflow_dispatch:        # allow manual trigger from GitHub Actions UI
 
+permissions:
+  contents: read
+  issues: write
+
 defaults:
   run:
     working-directory: app
@@ -65,8 +69,47 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_WEB }}
         run: |
-          # SSH into the running machine and run the refresh script
+          # SSH into the running machine and run the refresh script.
+          # `flyctl ssh console` gives a root shell, but the app itself (and
+          # /data's ownership, per app/entrypoint.sh) runs as the unprivileged
+          # appuser -- running this as root would leave any file it writes in
+          # /data root-owned, which appuser then can't write to until the
+          # next restart re-runs entrypoint.sh's chown. setpriv (same
+          # mechanism entrypoint.sh uses to drop privileges) keeps this
+          # consistent instead of introducing a separate su-based path.
           flyctl ssh console \
             --app vinyl-catalog \
-            --command "python /app/refresh_all.py --force" \
+            --command "setpriv --reuid=appuser --regid=appuser --init-groups python /app/refresh_all.py --force" \
             --quiet
+
+      - name: Notify on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `Daily refresh failed — ${new Date().toISOString().slice(0, 10)}`;
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            const body = `The scheduled **Vinyl App Daily Discogs Refresh** workflow failed.\n\nRun: ${runUrl}`;
+
+            const { data: openIssues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+            });
+
+            const existing = openIssues.find((issue) => issue.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+              });
+            }
