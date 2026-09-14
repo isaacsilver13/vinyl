@@ -360,6 +360,7 @@ def refresh_user(user: dict, force: bool = False, send_alerts: bool = True) -> b
                                 artist=w.get("artist") or "",
                                 title=w.get("title") or "",
                                 change_rows=price_alerts,
+                                threshold_pct=_PRICE_CHANGE_PCT,
                             )
                             if price_alert_count:
                                 logger.info("[%s] Price-change alerts queued: %d", username, price_alert_count)

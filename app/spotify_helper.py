@@ -99,7 +99,7 @@ def exchange_code(code: str, code_verifier: str) -> dict:
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=10) as resp:
         data = json.loads(resp.read())
 
     if "access_token" not in data:
@@ -127,7 +127,7 @@ def refresh_access_token(refresh_token: str) -> dict:
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=10) as resp:
         data = json.loads(resp.read())
 
     if "access_token" not in data:
@@ -180,7 +180,7 @@ def _spotify_get(access_token: str, url: str, params: dict | None = None) -> dic
         url,
         headers={"Authorization": f"Bearer {access_token}"},
     )
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=10) as resp:
         return json.loads(resp.read())
 
 

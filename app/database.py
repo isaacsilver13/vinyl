@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 _VINYL_DIR = Path(__file__).parent
 # If VINYL_DATA_DIR is set (e.g. on Fly.io), store all DB files there so they
@@ -44,10 +47,24 @@ def get_master_conn() -> sqlite3.Connection:
 # ── Users (multi-user auth) ───────────────────────────────────────────────────
 
 def init_users_table(conn: sqlite3.Connection) -> None:
+    # COLLATE NOCASE on username makes the UNIQUE constraint (and equality
+    # lookups in get_user_by_username) case-insensitive at the DB level, so
+    # "Alice" and "alice" can't both register -- they'd otherwise land in two
+    # separate per-user SQLite files (see db_path) that collide on
+    # case-insensitive filesystems. This is a defense-in-depth backstop for
+    # app.py's own lower()-based duplicate check at registration time (which
+    # doesn't protect e.g. a future direct create_user() caller, or a race
+    # between two concurrent registrations).
+    #
+    # NOTE: CREATE TABLE IF NOT EXISTS means an already-existing users table
+    # (from before this change) keeps its original BINARY collation --
+    # SQLite can't ALTER a column's collation in place. A production DB
+    # created before this fix needs a one-time manual migration (rebuild the
+    # table with COLLATE NOCASE and re-copy the rows) to actually pick this up.
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS users (
             user_id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            username         TEXT    NOT NULL UNIQUE,
+            username         TEXT    NOT NULL UNIQUE COLLATE NOCASE,
             password_hash    TEXT    NOT NULL,
             discogs_token    TEXT    NOT NULL,
             discogs_username TEXT    NOT NULL,
@@ -71,6 +88,18 @@ def get_user_by_username(conn: sqlite3.Connection, username: str) -> dict | None
 def get_all_users(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute("SELECT * FROM users ORDER BY user_id").fetchall()
     return [dict(r) for r in rows]
+
+
+def delete_user(conn: sqlite3.Connection, username: str) -> None:
+    """Remove a user row.
+
+    Used by app.py's registration flow to roll back the `users` row it just
+    inserted if the follow-up `init_user_db()` call fails -- without this,
+    that half-created state (a user row with no working per-user DB) is
+    permanently stuck: every future registration attempt with that username
+    hits the UNIQUE constraint with no way to recover.
+    """
+    conn.execute("DELETE FROM users WHERE username = ?", (username,))
 
 
 def create_user(
@@ -241,8 +270,17 @@ def _init_data_tables(conn: sqlite3.Connection) -> None:
     ]:
         try:
             conn.execute(_sql)
+        except sqlite3.OperationalError as exc:
+            # SQLite raises this with "duplicate column name: <col>" when the
+            # column already exists — that's the expected/tolerated case for
+            # an idempotent migration. Anything else (e.g. a typo'd column,
+            # locked file, disk full) is a genuine problem and shouldn't be
+            # silently swallowed.
+            if "duplicate column name" in str(exc).lower():
+                continue
+            logger.exception("Schema migration statement failed: %s", _sql)
         except Exception:
-            pass
+            logger.exception("Unexpected error running migration statement: %s", _sql)
     # Backfill first_seen for existing rows where missing.
     try:
         conn.execute("""
@@ -853,12 +891,19 @@ def create_price_change_alerts(
     artist: str,
     title: str,
     change_rows: list[dict],
+    threshold_pct: float,
 ) -> int:
     """Insert price-change alerts.
 
     Each entry in change_rows should include keys:
       listing_id, release_id, price_usd (current), prev_price_usd, change_pct,
       currency, condition, seller, ships_from, listing_url, first_seen
+
+    threshold_pct is the same fractional threshold (e.g. 0.10 for 10%) the
+    caller used to decide these rows were worth alerting on in the first
+    place (refresh_all.py's _PRICE_CHANGE_PCT) -- needed here too so a
+    still-pending alert whose net change has fallen back under it can be
+    cancelled instead of refreshed in place (see the third branch below).
     """
     if not change_rows:
         return 0
@@ -888,20 +933,117 @@ def create_price_change_alerts(
     if not payload:
         return 0
 
-    before = conn.total_changes
-    conn.executemany(
-        """
-        INSERT OR IGNORE INTO listing_alerts
-            (user_id, listing_id, release_id, alert_type, artist, title, price_usd, prev_price_usd, change_pct, currency,
-             condition, seller, ships_from, listing_url, first_seen, created_at)
-        VALUES
-            (:user_id, :listing_id, :release_id, :alert_type, :artist, :title, :price_usd, :prev_price_usd, :change_pct, :currency,
-             :condition, :seller, :ships_from, :listing_url, :first_seen, :created_at)
-        """,
-        payload,
-    )
-    inserted = conn.total_changes - before
-    return max(0, inserted)
+    inserted = 0
+    for p in payload:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO listing_alerts
+                (user_id, listing_id, release_id, alert_type, artist, title, price_usd, prev_price_usd, change_pct, currency,
+                 condition, seller, ships_from, listing_url, first_seen, created_at)
+            VALUES
+                (:user_id, :listing_id, :release_id, :alert_type, :artist, :title, :price_usd, :prev_price_usd, :change_pct, :currency,
+                 :condition, :seller, :ships_from, :listing_url, :first_seen, :created_at)
+            """,
+            p,
+        )
+        if cur.rowcount:
+            inserted += 1
+            continue
+
+        # A row for this (user_id, listing_id, alert_type) already exists —
+        # the INSERT OR IGNORE was a no-op. If that row was already sent,
+        # reopen it with the new price so this fresh price change actually
+        # gets alerted on.
+        cur = conn.execute(
+            """
+            UPDATE listing_alerts
+            SET price_usd      = :price_usd,
+                prev_price_usd = :prev_price_usd,
+                change_pct     = :change_pct,
+                currency       = :currency,
+                condition      = :condition,
+                seller         = :seller,
+                ships_from     = :ships_from,
+                listing_url    = :listing_url,
+                first_seen     = :first_seen,
+                created_at     = :created_at,
+                email_sent_at  = NULL,
+                email_status   = NULL,
+                email_error    = NULL
+            WHERE user_id = :user_id AND listing_id = :listing_id AND alert_type = :alert_type
+              AND email_sent_at IS NOT NULL
+            """,
+            p,
+        )
+        if cur.rowcount:
+            inserted += 1
+            continue
+
+        # Otherwise the existing row is still pending (email_sent_at IS NULL).
+        # Refresh its *current* price/percentage in place so that whenever the
+        # email eventually goes out it reports the real current price -- but
+        # deliberately keep the row's own prev_price_usd (the baseline from
+        # when this alert was first created) rather than overwriting it with
+        # :prev_price_usd, which was only computed against the last two
+        # snapshots and would otherwise let the comparison baseline drift
+        # with every price tick that arrives before the email sends (e.g.
+        # 10->8 creates the alert with prev=10; 8->5 and 5->2 must still
+        # compare against 10, not silently rebase to 8 then 5). change_pct is
+        # recomputed from the row's own prev_price_usd for the same reason.
+        #
+        # That baseline-relative recompute can land back under the alerting
+        # threshold even though it's still the same pending row (e.g. 10->8
+        # creates this alert at -20%, then a later 8->10 tick reaches this
+        # branch with price_usd=10, prev_price_usd=10, change_pct=0.0) -- so
+        # before updating in place, check the recomputed pct against
+        # threshold_pct and cancel (delete) the pending row instead of
+        # leaving it to eventually send as a no-op "0% change" email.
+        existing = conn.execute(
+            """
+            SELECT prev_price_usd FROM listing_alerts
+            WHERE user_id = :user_id AND listing_id = :listing_id AND alert_type = :alert_type
+              AND email_sent_at IS NULL
+            """,
+            p,
+        ).fetchone()
+        if existing is None:
+            continue
+
+        prev_price_usd = existing["prev_price_usd"]
+        if prev_price_usd is None or prev_price_usd == 0:
+            recomputed_pct = None
+        else:
+            recomputed_pct = (p["price_usd"] - prev_price_usd) / prev_price_usd
+
+        if recomputed_pct is not None and abs(recomputed_pct) < threshold_pct:
+            conn.execute(
+                """
+                DELETE FROM listing_alerts
+                WHERE user_id = :user_id AND listing_id = :listing_id AND alert_type = :alert_type
+                  AND email_sent_at IS NULL
+                """,
+                p,
+            )
+            continue
+
+        cur = conn.execute(
+            """
+            UPDATE listing_alerts
+            SET price_usd  = :price_usd,
+                change_pct = :change_pct,
+                currency       = :currency,
+                condition      = :condition,
+                seller         = :seller,
+                ships_from     = :ships_from,
+                listing_url    = :listing_url
+            WHERE user_id = :user_id AND listing_id = :listing_id AND alert_type = :alert_type
+              AND email_sent_at IS NULL
+            """,
+            {**p, "change_pct": recomputed_pct},
+        )
+        if cur.rowcount:
+            inserted += 1
+    return inserted
 
 
 def get_pending_listing_alerts(
@@ -1041,6 +1183,12 @@ def init_spotify_tables(conn: sqlite3.Connection) -> None:
             styles        TEXT DEFAULT '[]',
             last_fetched  TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS spotify_pkce (
+            id            INTEGER PRIMARY KEY CHECK (id = 1),
+            code_verifier TEXT NOT NULL,
+            created_at    TEXT NOT NULL
+        );
     """)
 
 
@@ -1064,6 +1212,35 @@ def save_spotify_tokens(conn: sqlite3.Connection,
 def get_spotify_tokens(conn: sqlite3.Connection) -> dict | None:
     row = conn.execute("SELECT * FROM spotify_tokens WHERE id = 1").fetchone()
     return dict(row) if row else None
+
+
+def save_pkce_verifier(conn: sqlite3.Connection, code_verifier: str) -> None:
+    """Persist the PKCE code_verifier for the in-flight Spotify OAuth handshake.
+
+    Only one authorisation attempt can be in flight at a time (single-row,
+    like spotify_tokens above) — a fresh call overwrites any prior verifier.
+    """
+    conn.execute("""
+        INSERT INTO spotify_pkce (id, code_verifier, created_at)
+        VALUES (1, :code_verifier, :created_at)
+        ON CONFLICT(id) DO UPDATE SET
+            code_verifier = excluded.code_verifier,
+            created_at    = excluded.created_at
+    """, {"code_verifier": code_verifier, "created_at": datetime.utcnow().isoformat()})
+
+
+def get_pkce_verifier(conn: sqlite3.Connection) -> str | None:
+    """Retrieve and consume the stored PKCE code_verifier.
+
+    Returns None if no verifier is stored (e.g. the auth session expired or
+    was never started). PKCE verifiers are single-use and short-lived by
+    design, so the row is deleted once read to prevent stale reuse.
+    """
+    row = conn.execute("SELECT code_verifier FROM spotify_pkce WHERE id = 1").fetchone()
+    if not row:
+        return None
+    conn.execute("DELETE FROM spotify_pkce WHERE id = 1")
+    return row["code_verifier"]
 
 
 def save_spotify_suggestions(conn: sqlite3.Connection, suggestions: list[dict]) -> None:

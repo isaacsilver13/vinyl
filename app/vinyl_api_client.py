@@ -5,12 +5,25 @@ the environment and POSTs to `/listings/bulk` for demo purposes.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import requests
 from typing import List, Dict, Any
+from urllib.parse import urlparse
+
+_LOCAL_HOSTS = {"127.0.0.1", "localhost"}
+
 
 def _api_url() -> str:
-    return os.environ.get("VINYL_API_URL", "http://127.0.0.1:8000")
+    url = os.environ.get("VINYL_API_URL", "http://127.0.0.1:8000")
+    app_env = os.environ.get("VINYL_APP_ENV", "local").strip().lower()
+    if app_env == "local" and urlparse(url).hostname not in _LOCAL_HOSTS:
+        raise RuntimeError(
+            f"VINYL_API_URL={url!r} points outside localhost while VINYL_APP_ENV=local "
+            "(refusing to let local dev write to a non-local API). Set "
+            "VINYL_APP_ENV=production if this is intentional."
+        )
+    return url
 
 
 def _api_key() -> str | None:
@@ -61,7 +74,13 @@ def post_listings_bulk(release_id: int, listings: List[Dict[str, Any]]) -> Dict[
             if lst.get("id"):
                 cl["listing_id"] = str(lst.get("id"))
             elif lst.get("listing_url"):
-                cl["listing_id"] = str(hash(lst.get("listing_url")))
+                # Stable, process-independent id: Python's built-in hash() is
+                # salted per-process (PYTHONHASHSEED), so it produced a
+                # different value every run and made the same real-world
+                # listing look "new" each time.
+                cl["listing_id"] = hashlib.sha256(
+                    lst.get("listing_url").encode("utf-8")
+                ).hexdigest()
             else:
                 # skip entries without an identifier
                 continue
