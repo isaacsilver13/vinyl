@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import os
 import random
+import re
+import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -43,6 +45,10 @@ st.set_page_config(
 db.init_db()
 
 # ── Login gate ────────────────────────────────────────────────────────────────
+
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9_-]{3,32}$")
+_EMAIL_RE    = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
 
 def _show_login() -> None:
     # ── Login background: dimly lit record store / crate digging ─────────────
@@ -119,7 +125,7 @@ def _show_login() -> None:
                 reg_password        = st.text_input("Password", type="password",
                                                      help="Minimum 8 characters")
                 reg_password_confirm = st.text_input("Confirm Password", type="password")
-                reg_discogs_token   = st.text_input("Discogs Token",
+                reg_discogs_token   = st.text_input("Discogs Token", type="password",
                                                      help="Settings → Developers on discogs.com")
                 reg_discogs_username = st.text_input("Discogs Username",
                                                       help="Your username on discogs.com")
@@ -137,6 +143,11 @@ def _show_login() -> None:
 
                 if not reg_username.strip():
                     _errors.append("Username is required.")
+                elif not _USERNAME_RE.match(reg_username.strip()):
+                    _errors.append(
+                        "Username must be 3-32 characters and may only contain "
+                        "letters, numbers, underscores, and hyphens."
+                    )
                 if len(reg_password) < 8:
                     _errors.append("Password must be at least 8 characters.")
                 if reg_password != reg_password_confirm:
@@ -145,6 +156,8 @@ def _show_login() -> None:
                     _errors.append("Discogs Token is required.")
                 if not reg_discogs_username.strip():
                     _errors.append("Discogs Username is required.")
+                if reg_email.strip() and not _EMAIL_RE.match(reg_email.strip()):
+                    _errors.append("Alert Email is not a valid email address.")
                 if not _expected_code:
                     _errors.append("Registration is not currently open.")
                 elif reg_code != _expected_code:
@@ -152,8 +165,11 @@ def _show_login() -> None:
 
                 if not _errors:
                     with db.get_master_conn() as _conn:
-                        _existing = db.get_user_by_username(_conn, reg_username.strip())
-                    if _existing:
+                        _existing_users = db.get_all_users(_conn)
+                    if any(
+                        u["username"].lower() == reg_username.strip().lower()
+                        for u in _existing_users
+                    ):
                         _errors.append(f"Username '{reg_username.strip()}' is already taken.")
 
                 if _errors:
@@ -162,21 +178,65 @@ def _show_login() -> None:
                 else:
                     _pw_hash  = bcrypt.hashpw(reg_password.encode(), bcrypt.gensalt()).decode()
                     _db_path  = f"vinyl_{reg_username.strip()}.db"
-                    with db.get_master_conn() as _conn:
-                        db.create_user(
-                            _conn,
+                    try:
+                        with db.get_master_conn() as _conn:
+                            db.create_user(
+                                _conn,
+                                reg_username.strip(),
+                                _pw_hash,
+                                reg_discogs_token.strip(),
+                                reg_discogs_username.strip(),
+                                _db_path,
+                                reg_email.strip() or None,
+                            )
+                    except sqlite3.IntegrityError:
+                        # By far the most likely cause of a constraint failure
+                        # here: the case-insensitive UNIQUE(username) lost the
+                        # race with the pre-check above (two concurrent
+                        # registrations for the same username). The generic
+                        # "please try again" message is actively wrong for
+                        # this case -- retrying identically will never work --
+                        # so name the actual problem instead.
+                        logging.getLogger(__name__).warning(
+                            "Registration failed: username=%s already taken (UNIQUE constraint)",
                             reg_username.strip(),
-                            _pw_hash,
-                            reg_discogs_token.strip(),
-                            reg_discogs_username.strip(),
-                            _db_path,
-                            reg_email.strip() or None,
                         )
-                    db.init_user_db(_db_path)
-                    with db.get_master_conn() as _conn:
-                        _new_user = db.get_user_by_username(_conn, reg_username.strip())
-                    st.session_state["current_user"] = dict(_new_user)
-                    st.rerun()
+                        st.error("That username is already taken — please choose another.")
+                    except Exception:
+                        # Raw DB exceptions leak schema/implementation details
+                        # to the browser -- log the real error server-side
+                        # and show a generic message instead.
+                        logging.getLogger(__name__).exception("Account creation failed for username=%s", reg_username.strip())
+                        st.error("Could not create account. Please try again.")
+                    else:
+                        try:
+                            db.init_user_db(_db_path)
+                        except Exception:
+                            # The user row was created but the per-user DB
+                            # wasn't -- if left as-is this username is
+                            # permanently stuck (UNIQUE constraint blocks
+                            # every future registration attempt, but there's
+                            # no working account behind it). Roll back the
+                            # user row so the username becomes available
+                            # again instead of leaving a half-created account.
+                            logging.getLogger(__name__).exception(
+                                "init_user_db failed after creating user row for username=%s -- rolling back",
+                                reg_username.strip(),
+                            )
+                            try:
+                                with db.get_master_conn() as _conn:
+                                    db.delete_user(_conn, reg_username.strip())
+                            except Exception:
+                                logging.getLogger(__name__).exception(
+                                    "Rollback of user row failed for username=%s -- account may be stuck",
+                                    reg_username.strip(),
+                                )
+                            st.error("Could not create account. Please try again.")
+                        else:
+                            with db.get_master_conn() as _conn:
+                                _new_user = db.get_user_by_username(_conn, reg_username.strip())
+                            st.session_state["current_user"] = dict(_new_user)
+                            st.rerun()
 
 
 if "current_user" not in st.session_state:
@@ -205,6 +265,31 @@ def _load_collection_data(db_path: str) -> tuple[list[dict], dict[int, dict], di
     return releases, play_stats, custom_tags
 
 
+@st.cache_data(ttl=120)
+def _load_play_log_data(db_path: str) -> tuple[list[dict], dict[str, int]]:
+    with db.get_conn(db_path) as conn:
+        recent         = db.get_recent_plays(conn, limit=200)
+        counts_by_date = db.get_play_counts_by_date(conn, days=365)
+    return recent, counts_by_date
+
+
+@st.cache_data(ttl=300)
+def _load_streak_data(db_path: str) -> dict[str, int]:
+    with db.get_conn(db_path) as conn:
+        return db.get_play_counts_by_date(conn, days=3650)
+
+
+@st.cache_data(ttl=120)
+def _load_wantlist_listings(db_path: str, release_ids: tuple[int, ...]) -> dict[int, list]:
+    result: dict[int, list] = {}
+    with db.get_conn(db_path) as conn:
+        for rid in release_ids:
+            rows = db.get_wantlist_listings(conn, rid)
+            if rows:
+                result[rid] = rows
+    return result
+
+
 def _get_ct(release_id: int) -> dict:
     return _custom_tags_cache.get(
         release_id,
@@ -231,7 +316,7 @@ if "startup_sync_done" not in st.session_state:
                     if age >= timedelta(hours=24):
                         st.session_state["auto_sync_needed"] = True
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("startup sync check failed")
 
 # ── Refresh All dialog ────────────────────────────────────────────────────────
 
@@ -252,9 +337,16 @@ def _run_refresh_all(user_token: str, user_dname: str, user_db: str, vinyl_items
         _load_collection_data.clear()
         st.session_state.pop("show_empty_warning", None)
         st.session_state.pop("auto_sync_needed", None)
-    except Exception as e:
-        _p1.progress(100)
-        st.error(f"Step 1 (Sync Collection) failed: {e}")
+    except Exception:
+        # Clear the bar rather than jumping it to 100% -- a full bar next to
+        # an error reads as "finished, then something else broke" rather
+        # than "stopped partway".
+        _p1.empty()
+        logging.getLogger(__name__).exception("Step 1 (Sync Collection) failed")
+        st.error(
+            "Step 1 (Sync Collection) failed — this usually means an expired "
+            "Discogs token or a temporary Discogs rate limit. Try again in a minute."
+        )
         return
     _p1.progress(100)
     _n1.caption(f"✓ {_count} records synced")
@@ -270,9 +362,13 @@ def _run_refresh_all(user_token: str, user_dname: str, user_db: str, vinyl_items
             force=True, log_fn=lambda _m: None,
             client=_client, discogs_username=user_dname, db_path=user_db,
         )
-    except Exception as e:
-        _p2.progress(100)
-        st.error(f"Step 2 (Sync Wantlist) failed: {e}")
+    except Exception:
+        _p2.empty()
+        logging.getLogger(__name__).exception("Step 2 (Sync Wantlist) failed")
+        st.error(
+            "Step 2 (Sync Wantlist) failed — this usually means an expired "
+            "Discogs token or a temporary Discogs rate limit. Try again in a minute."
+        )
         return
     _p2.progress(100)
     _n2.caption(f"✓ {_n} wantlist items synced")
@@ -312,10 +408,15 @@ def _run_refresh_all(user_token: str, user_dname: str, user_db: str, vinyl_items
                         for _lst in _fetched if _lst.get("listing_id") is not None
                     ]
                     db.bulk_upsert_wantlist_listings(_conn, _w["release_id"], _rows)
-        except Exception as e:
-            _p3.progress(100)
-            st.error(f"Step 3 (Fetch Listings) failed: {e}")
+        except Exception:
+            _p3.empty()
+            logging.getLogger(__name__).exception("Step 3 (Fetch Listings) failed")
+            st.error(
+                "Step 3 (Fetch Listings) failed — this usually means an expired "
+                "Discogs token or a temporary Discogs rate limit. Try again in a minute."
+            )
             return
+        _load_wantlist_listings.clear()
         _p3.progress(100)
         _n3.caption(f"✓ Listings fetched for {len(vinyl_items)} item(s)")
 
@@ -330,9 +431,13 @@ def _run_refresh_all(user_token: str, user_dname: str, user_db: str, vinyl_items
             force=True, log_fn=lambda _m: None,
             client=_client, db_path=user_db,
         )
-    except Exception as e:
-        _p4.progress(100)
-        st.error(f"Step 4 (Refresh Suggestions) failed: {e}")
+    except Exception:
+        _p4.empty()
+        logging.getLogger(__name__).exception("Step 4 (Refresh Suggestions) failed")
+        st.error(
+            "Step 4 (Refresh Suggestions) failed — this usually means an expired "
+            "Discogs token or a temporary Discogs rate limit. Try again in a minute."
+        )
         return
     _p4.progress(100)
     _n4.caption(f"✓ {_sug_count} suggestions found")
@@ -558,18 +663,25 @@ with tab_browse:
                         st.caption(f"{r_p['year'] or '?'} · {', '.join(r_p['discogs_genres']) or '—'}")
                     with pc3:
                         if st.button("Log Play", key="random_log_play", use_container_width=True):
-                            with db.get_conn(_user_db) as conn:
-                                db.log_play(conn, r_p["release_id"])
                             try:
-                                vinyl_api_client.log_play(
-                                    _user["user_id"], r_p["release_id"],
-                                    played_at=datetime.utcnow().isoformat(), source="streamlit",
-                                )
+                                with db.get_conn(_user_db) as conn:
+                                    db.log_play(conn, r_p["release_id"])
                             except Exception:
-                                logging.getLogger(__name__).warning("Failed to POST play to Vinyl API")
-                            st.session_state.pop("random_pick", None)
-                            _load_collection_data.clear()
-                            st.rerun()
+                                logging.getLogger(__name__).exception("Could not log play for release_id=%s", r_p["release_id"])
+                                st.error("Could not log play. Please try again.")
+                            else:
+                                try:
+                                    vinyl_api_client.log_play(
+                                        _user["user_id"], r_p["release_id"],
+                                        played_at=datetime.utcnow().isoformat(), source="streamlit",
+                                    )
+                                except Exception:
+                                    logging.getLogger(__name__).warning("Failed to POST play to Vinyl API")
+                                st.session_state.pop("random_pick", None)
+                                _load_collection_data.clear()
+                                _load_play_log_data.clear()
+                                _load_streak_data.clear()
+                                st.rerun()
                         if st.button("Dismiss", key="random_dismiss", use_container_width=True):
                             st.session_state.pop("random_pick", None)
                             st.rerun()
@@ -605,17 +717,24 @@ with tab_browse:
                         st.caption(f"{play_count}x · last {lp_str}")
                 with lc4:
                     if st.button("Log", key=f"qplay_list_{r['release_id']}_{r['instance_id']}", help="Log play"):
-                        with db.get_conn(_user_db) as conn:
-                            db.log_play(conn, r["release_id"])
                         try:
-                            vinyl_api_client.log_play(
-                                _user["user_id"], r["release_id"],
-                                played_at=datetime.utcnow().isoformat(), source="streamlit",
-                            )
+                            with db.get_conn(_user_db) as conn:
+                                db.log_play(conn, r["release_id"])
                         except Exception:
-                            logging.getLogger(__name__).warning("Failed to POST play to Vinyl API")
-                        _load_collection_data.clear()
-                        st.rerun()
+                            logging.getLogger(__name__).exception("Could not log play for release_id=%s", r["release_id"])
+                            st.error("Could not log play. Please try again.")
+                        else:
+                            try:
+                                vinyl_api_client.log_play(
+                                    _user["user_id"], r["release_id"],
+                                    played_at=datetime.utcnow().isoformat(), source="streamlit",
+                                )
+                            except Exception:
+                                logging.getLogger(__name__).warning("Failed to POST play to Vinyl API")
+                            _load_collection_data.clear()
+                            _load_play_log_data.clear()
+                            _load_streak_data.clear()
+                            st.rerun()
                     with st.expander("Edit"):
                         _existing = ct.get("custom_tags", [])
                         _new_tags = st.multiselect(
@@ -668,17 +787,24 @@ with tab_browse:
                             key=f"qplay_{r['release_id']}_{r['instance_id']}",
                             use_container_width=True,
                         ):
-                            with db.get_conn(_user_db) as conn:
-                                db.log_play(conn, r["release_id"])
                             try:
-                                vinyl_api_client.log_play(
-                                    _user["user_id"], r["release_id"],
-                                    played_at=datetime.utcnow().isoformat(), source="streamlit",
-                                )
+                                with db.get_conn(_user_db) as conn:
+                                    db.log_play(conn, r["release_id"])
                             except Exception:
-                                logging.getLogger(__name__).warning("Failed to POST play to Vinyl API")
-                            _load_collection_data.clear()
-                            st.rerun()
+                                logging.getLogger(__name__).exception("Could not log play for release_id=%s", r["release_id"])
+                                st.error("Could not log play. Please try again.")
+                            else:
+                                try:
+                                    vinyl_api_client.log_play(
+                                        _user["user_id"], r["release_id"],
+                                        played_at=datetime.utcnow().isoformat(), source="streamlit",
+                                    )
+                                except Exception:
+                                    logging.getLogger(__name__).warning("Failed to POST play to Vinyl API")
+                                _load_collection_data.clear()
+                                _load_play_log_data.clear()
+                                _load_streak_data.clear()
+                                st.rerun()
                         with st.expander("Edit tags"):
                             st.caption("Discogs: " + (", ".join(r["discogs_genres"]) or "None"))
                             st.caption("Styles:  " + (", ".join(r["discogs_styles"])  or "None"))
@@ -724,9 +850,7 @@ with tab_browse:
 with tab_playlog:
     st.subheader("Play Log")
 
-    with db.get_conn(_user_db) as conn:
-        recent               = db.get_recent_plays(conn, limit=200)
-        _play_counts_by_date = db.get_play_counts_by_date(conn, days=365)
+    recent, _play_counts_by_date = _load_play_log_data(_user_db)
 
     if not recent:
         st.info("No plays logged yet. Use the Log Play button on any record.")
@@ -823,18 +947,25 @@ with tab_playlog:
                                 st.caption(f"Last played: {_lp[:10] if _lp else 'never'}")
                             with _spc3:
                                 if st.button("Log Play", key="stale_surprise_log", use_container_width=True):
-                                    with db.get_conn(_user_db) as conn:
-                                        db.log_play(conn, _s_match["release_id"])
                                     try:
-                                        vinyl_api_client.log_play(
-                                            _user["user_id"], _s_match["release_id"],
-                                            played_at=datetime.utcnow().isoformat(), source="streamlit",
-                                        )
+                                        with db.get_conn(_user_db) as conn:
+                                            db.log_play(conn, _s_match["release_id"])
                                     except Exception:
-                                        logging.getLogger(__name__).warning("Failed to POST play to Vinyl API")
-                                    st.session_state.pop("stale_surprise_pick", None)
-                                    _load_collection_data.clear()
-                                    st.rerun()
+                                        logging.getLogger(__name__).exception("Could not log play for release_id=%s", _s_match["release_id"])
+                                        st.error("Could not log play. Please try again.")
+                                    else:
+                                        try:
+                                            vinyl_api_client.log_play(
+                                                _user["user_id"], _s_match["release_id"],
+                                                played_at=datetime.utcnow().isoformat(), source="streamlit",
+                                            )
+                                        except Exception:
+                                            logging.getLogger(__name__).warning("Failed to POST play to Vinyl API")
+                                        st.session_state.pop("stale_surprise_pick", None)
+                                        _load_collection_data.clear()
+                                        _load_play_log_data.clear()
+                                        _load_streak_data.clear()
+                                        st.rerun()
                         st.divider()
 
                 pp_cols = st.columns(min(3, len(top_picks)))
@@ -849,11 +980,25 @@ with tab_playlog:
                         if st.button(
                             "Log", key=f"stale_log_{_pr['release_id']}", use_container_width=True
                         ):
-                            with db.get_conn(_user_db) as conn:
-                                db.log_play(conn, _pr["release_id"])
-                            st.session_state.pop("stale_surprise_pick", None)
-                            _load_collection_data.clear()
-                            st.rerun()
+                            try:
+                                with db.get_conn(_user_db) as conn:
+                                    db.log_play(conn, _pr["release_id"])
+                            except Exception:
+                                logging.getLogger(__name__).exception("Could not log play for release_id=%s", _pr["release_id"])
+                                st.error("Could not log play. Please try again.")
+                            else:
+                                try:
+                                    vinyl_api_client.log_play(
+                                        _user["user_id"], _pr["release_id"],
+                                        played_at=datetime.utcnow().isoformat(), source="streamlit",
+                                    )
+                                except Exception:
+                                    logging.getLogger(__name__).warning("Failed to POST play to Vinyl API")
+                                st.session_state.pop("stale_surprise_pick", None)
+                                _load_collection_data.clear()
+                                _load_play_log_data.clear()
+                                _load_streak_data.clear()
+                                st.rerun()
 
                 if len(stale_sorted) > 3:
                     with st.expander(f"See all {len(stale_sorted)} overdue records"):
@@ -899,6 +1044,8 @@ with tab_playlog:
                     for row in rows_to_delete:
                         db.delete_play(conn, row["_id"])
                 _load_collection_data.clear()
+                _load_play_log_data.clear()
+                _load_streak_data.clear()
                 st.rerun()
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -923,8 +1070,7 @@ with tab_stats:
         # ── Listening streak metrics ───────────────────────────────────────
         if _play_stats:
             from datetime import date as _date_cls, timedelta as _td_cls
-            with db.get_conn(_user_db) as conn:
-                _all_date_counts = db.get_play_counts_by_date(conn, days=3650)
+            _all_date_counts = _load_streak_data(_user_db)
             _today_d = _date_cls.today()
             # Current streak (consecutive days ending today)
             _cur_streak, _d = 0, _today_d
@@ -1179,12 +1325,9 @@ with tab_wantlist:
             return rows
 
         # Load cached listings from DB
-        _db_listings: dict[int, list] = {}
-        with db.get_conn(_user_db) as _conn:
-            for _w in _vinyl_items:
-                _rows = db.get_wantlist_listings(_conn, _w["release_id"])
-                if _rows:
-                    _db_listings[_w["release_id"]] = _rows
+        _db_listings = _load_wantlist_listings(
+            _user_db, tuple(_w["release_id"] for _w in _vinyl_items)
+        )
 
         # Build and render
         _all_rows: list[dict] = []

@@ -1,3 +1,7 @@
+[client]
+# Don't leak raw stack traces / file paths to end users on unhandled errors.
+showErrorDetails = "none"
+
 [theme]
 base                  = "dark"
 primaryColor          = "#e8b84b"
