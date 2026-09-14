@@ -18,6 +18,15 @@ if _is_sqlite:
 
 
 def init_db():
+    """Create all tables directly from the ORM models via create_all().
+
+    Not called from vinyl_api.main's startup path anymore -- migrate_or_stamp.py
+    (Alembic) is the single source of schema truth now that real migrations
+    exist, and calling this here too would let create_all silently re-create
+    anything a future migration intentionally drops or renames. Kept around
+    as a standalone convenience for e.g. quick throwaway local scripts/REPL
+    use outside the normal migration path.
+    """
     # import models to register them with Base before creating tables
     from . import models  # noqa: F401
     Base.metadata.create_all(bind=engine)

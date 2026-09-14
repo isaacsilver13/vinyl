@@ -30,3 +30,14 @@ def install() -> None:
 
 def recent_errors() -> list[dict]:
     return list(_recent_errors)
+
+
+def clear() -> None:
+    """Empty the ring buffer.
+
+    Exists mainly for test isolation (see tests/conftest.py's autouse
+    fixture) -- the buffer is process-wide module state, so without an
+    explicit reset between tests, whatever an earlier test logged leaks into
+    a later test's /health/errors response depending on run order.
+    """
+    _recent_errors.clear()

@@ -28,3 +28,14 @@ jobs:
         run: python -m compileall -q vinyl_api tests
       - name: Run tests
         run: python -m pytest -q
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        # `defaults.run.working-directory: api` (above) already puts this
+        # step's cwd at api/, matching the build context Fly uses
+        # (fly.toml lives in api/ with `dockerfile = 'Dockerfile'`), so the
+        # context here is "." rather than "./api".
+        run: docker build -t vinyl-api-ci-check .

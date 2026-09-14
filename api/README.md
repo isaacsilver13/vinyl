@@ -27,6 +27,20 @@ defaults to `sqlite:///./vinyl_api_dev.db`. Set `VINYL_API_KEY` to require a
 bearer token for write endpoints; leaving it unset enables keyless local
 development.
 
+Schema is managed entirely by Alembic — run `python migrate_or_stamp.py`
+against a fresh local DB before starting the server for the first time (the
+Dockerfile/`entrypoint.sh` does this automatically in containers; the test
+suite does the equivalent itself in `tests/conftest.py`). `main.py`'s startup
+path does **not** call `Base.metadata.create_all()` any more, so an
+unmigrated DB will fail with "no such table" until `migrate_or_stamp.py` has
+run against it at least once. To add a schema change, add a new revision
+under `vinyl_api/alembic/versions/`, not just a `models.py` edit.
+
+`/docs`, `/redoc`, and `/openapi.json` are only served when
+`VINYL_API_ENV=local` (the default) — they're disabled in any other
+environment. `/health/errors` requires the same bearer key as the write
+endpoints.
+
 ## Fly.io deployment
 
 The production configuration is in `fly.toml` and uses one Fly machine with a
@@ -54,5 +68,9 @@ VINYL_API_KEY=the-same-secret-configured-on-fly
 ## API surface
 
 - `GET /health` - unauthenticated health check
+- `GET /health/ready` - unauthenticated DB connectivity check
+- `GET /health/metrics` - unauthenticated activity/freshness counters
+- `GET /health/errors` - bearer key required when configured; recent
+  ERROR-level log records (kept in-memory only, last 50)
 - `POST /listings/bulk` - persist listings; bearer key required when configured
 - `POST /users/{user_id}/plays` - log a play; bearer key required when configured
