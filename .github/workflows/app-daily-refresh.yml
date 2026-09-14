@@ -68,31 +68,71 @@ jobs:
 
           echo "machine_id=$machine_id" >> "$GITHUB_OUTPUT"
 
-      - name: Run refresh via Fly.io machine exec
+      - name: Start refresh in background over SSH
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_WEB }}
         run: |
-          # `flyctl ssh console` proxies an interactive shell through
-          # flyctl's own userland WireGuard tunnel, which has documented
-          # community reports of dropping long-held sessions with exactly
-          # the error seen on the last two scheduled runs here ("ssh shell:
-          # wait: remote command exited without exit status or exit
-          # signal", 5-7 minutes in, with refresh_all.py still healthy per
-          # its own logs). `flyctl machine exec` runs the command through
-          # the Machines API's exec mechanism instead of that SSH proxy and
-          # takes its own explicit --timeout, so it isn't subject to the
-          # same tunnel session-durability limits. 600s (10m) is the max
-          # the Machines API allows for a single exec (a larger value is
-          # rejected outright: "timeout must not exceed 600 seconds") --
-          # this is a hard ceiling, not a tuning choice.
+          # Three approaches were tried and ruled out before this one:
+          #   - `flyctl ssh console --command ...` holding the session open
+          #     for the job's full duration: the tunnel doesn't reliably
+          #     survive that long (dropped mid-session on the 2026-09-12/13
+          #     scheduled runs -- "ssh shell: wait: remote command exited
+          #     without exit status or exit signal").
+          #   - `flyctl machine exec`: the Machines API's exec endpoint has
+          #     a hard, non-configurable 60s server-side timeout -- far too
+          #     short, confirmed via Fly's own community forum.
+          #   - `fly console` (a `console_command` spawning a temporary
+          #     machine): temporary machines don't get volume mounts, so it
+          #     can't reach /data (the SQLite DB and Discogs tokens the
+          #     refresh needs); Fly volumes are also strictly single-attach,
+          #     so a second machine couldn't share the running one's volume
+          #     anyway.
           #
-          # Same setpriv rationale as before: the machine's default exec
-          # user is root, but /data is owned by appuser (per
-          # app/entrypoint.sh), so this drops privileges the same way.
-          flyctl machine exec "${{ steps.start_machine.outputs.machine_id }}" \
-            "setpriv --reuid=appuser --regid=appuser --init-groups python /app/refresh_all.py --force" \
+          # Instead: a brief SSH call starts the job fully detached
+          # (app/scripts/run_refresh_background.sh: setsid + nohup, stdio
+          # redirected to a log file) and returns immediately: it never
+          # holds one connection open for the job's full duration. The next
+          # step polls for completion via separate short-lived SSH calls.
+          flyctl ssh console \
             --app vinyl-catalog \
-            --timeout 600
+            --command "sh /app/scripts/run_refresh_background.sh" \
+            --quiet
+
+      - name: Poll for refresh completion
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_WEB }}
+        run: |
+          set -euo pipefail
+          status="RUNNING"
+          # 40 * 30s = 20 minutes -- comfortable headroom above the longest
+          # refresh observed so far (~7-8 minutes in, still mid-collection-
+          # sync, before the old ssh-console approach used to die).
+          for i in $(seq 1 40); do
+            status="$(flyctl ssh console --app vinyl-catalog --command "sh /app/scripts/refresh_status.sh" --quiet 2>/dev/null | tail -1 | tr -d '\r')"
+            echo "[$i/40] $status"
+            case "$status" in
+              DONE*) break ;;
+            esac
+            sleep 30
+          done
+
+          case "$status" in
+            DONE*) : ;;
+            *)
+              echo "Refresh did not finish within the poll window (20 minutes)."
+              exit 1
+              ;;
+          esac
+
+          exit_code="${status#DONE }"
+
+          echo "----- last 100 lines of refresh.log -----"
+          flyctl ssh console --app vinyl-catalog --command "tail -n 100 /tmp/refresh.log" --quiet 2>/dev/null || true
+
+          if [ "$exit_code" != "0" ]; then
+            echo "refresh_all.py exited with code $exit_code"
+            exit 1
+          fi
 
       - name: Notify on failure
         if: failure()
