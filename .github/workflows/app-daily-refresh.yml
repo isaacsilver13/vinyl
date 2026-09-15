@@ -122,21 +122,26 @@ jobs:
         run: |
           set -euo pipefail
           status="RUNNING"
-          # 90 * 30s = 45 minutes. The 2026-09-15 test run (after fixing
-          # the autostop-kills-the-job root cause) polled clean for the
-          # full 20-minute window with zero failures/kills -- the job was
-          # still legitimately running, not stuck -- so 20 minutes was
-          # just too short a ceiling for a real full-size run, not a sign
-          # of a problem. 45 minutes gives real headroom above that.
-          for i in $(seq 1 90); do
+          # 180 * 30s = 90 minutes. Confirmed via two real runs on
+          # 2026-09-15: the autostop-kills-the-job root cause is fixed --
+          # both the 20-minute and 45-minute windows polled clean the
+          # entire time, zero failures/kills. The 45-minute run was
+          # independently confirmed (by checking the app's actual data)
+          # to have completed successfully -- it just kept running past
+          # our poll window, which then falsely reported failure and would
+          # have opened a spurious GitHub issue. There's no real downside
+          # to a generous ceiling here (this runs once a day), so 90
+          # minutes essentially rules out a false timeout for a legitimate
+          # run while still catching a genuinely hung job eventually.
+          for i in $(seq 1 180); do
             # `|| true` on the substitution itself, not just the pipeline:
             # with `set -e`, a failing command substitution assigned to a
             # variable aborts the whole script even outside a conditional --
             # a single transient SSH blip on one poll attempt must not kill
-            # 45 minutes of otherwise-successful polling. A blip just shows
+            # 90 minutes of otherwise-successful polling. A blip just shows
             # up as an empty/unchanged status and gets retried next loop.
             status="$(flyctl ssh console --app vinyl-catalog --command "sh /app/scripts/refresh_status.sh" --quiet 2>/dev/null | tail -1 | tr -d '\r' || true)"
-            echo "[$i/90] ${status:-<poll failed, will retry>}"
+            echo "[$i/180] ${status:-<poll failed, will retry>}"
             case "$status" in
               DONE*) break ;;
             esac
@@ -146,7 +151,7 @@ jobs:
           case "$status" in
             DONE*) : ;;
             *)
-              echo "Refresh did not finish within the poll window (45 minutes)."
+              echo "Refresh did not finish within the poll window (90 minutes)."
               exit 1
               ;;
           esac
