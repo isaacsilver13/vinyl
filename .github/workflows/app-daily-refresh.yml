@@ -122,18 +122,21 @@ jobs:
         run: |
           set -euo pipefail
           status="RUNNING"
-          # 40 * 30s = 20 minutes -- comfortable headroom above the longest
-          # refresh observed so far (~7-8 minutes in, still mid-collection-
-          # sync, before the old ssh-console approach used to die).
-          for i in $(seq 1 40); do
+          # 90 * 30s = 45 minutes. The 2026-09-15 test run (after fixing
+          # the autostop-kills-the-job root cause) polled clean for the
+          # full 20-minute window with zero failures/kills -- the job was
+          # still legitimately running, not stuck -- so 20 minutes was
+          # just too short a ceiling for a real full-size run, not a sign
+          # of a problem. 45 minutes gives real headroom above that.
+          for i in $(seq 1 90); do
             # `|| true` on the substitution itself, not just the pipeline:
             # with `set -e`, a failing command substitution assigned to a
             # variable aborts the whole script even outside a conditional --
             # a single transient SSH blip on one poll attempt must not kill
-            # 20 minutes of otherwise-successful polling. A blip just shows
+            # 45 minutes of otherwise-successful polling. A blip just shows
             # up as an empty/unchanged status and gets retried next loop.
             status="$(flyctl ssh console --app vinyl-catalog --command "sh /app/scripts/refresh_status.sh" --quiet 2>/dev/null | tail -1 | tr -d '\r' || true)"
-            echo "[$i/40] ${status:-<poll failed, will retry>}"
+            echo "[$i/90] ${status:-<poll failed, will retry>}"
             case "$status" in
               DONE*) break ;;
             esac
@@ -143,7 +146,7 @@ jobs:
           case "$status" in
             DONE*) : ;;
             *)
-              echo "Refresh did not finish within the poll window (20 minutes)."
+              echo "Refresh did not finish within the poll window (45 minutes)."
               exit 1
               ;;
           esac
