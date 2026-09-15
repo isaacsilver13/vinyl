@@ -108,8 +108,14 @@ jobs:
           # refresh observed so far (~7-8 minutes in, still mid-collection-
           # sync, before the old ssh-console approach used to die).
           for i in $(seq 1 40); do
-            status="$(flyctl ssh console --app vinyl-catalog --command "sh /app/scripts/refresh_status.sh" --quiet 2>/dev/null | tail -1 | tr -d '\r')"
-            echo "[$i/40] $status"
+            # `|| true` on the substitution itself, not just the pipeline:
+            # with `set -e`, a failing command substitution assigned to a
+            # variable aborts the whole script even outside a conditional --
+            # a single transient SSH blip on one poll attempt must not kill
+            # 20 minutes of otherwise-successful polling. A blip just shows
+            # up as an empty/unchanged status and gets retried next loop.
+            status="$(flyctl ssh console --app vinyl-catalog --command "sh /app/scripts/refresh_status.sh" --quiet 2>/dev/null | tail -1 | tr -d '\r' || true)"
+            echo "[$i/40] ${status:-<poll failed, will retry>}"
             case "$status" in
               DONE*) break ;;
             esac
