@@ -58,6 +58,24 @@ jobs:
           fi
 
           echo "Using Fly machine $machine_id (state: $machine_state)."
+
+          # app/fly.toml sets auto_stop_machines='stop' with
+          # min_machines_running=0 -- Fly's proxy autostops this machine
+          # when it sees no HTTP traffic, with zero awareness of the
+          # detached background refresh process started over SSH later in
+          # this job. Confirmed via fly logs: this is exactly what killed
+          # the run on 2026-09-15 (machine stopped/rebooted mid-refresh at
+          # the ~9 minute mark, taking the running python process with it,
+          # then sat stopped for ~9.5 minutes until a poll happened to wake
+          # it again). Disable autostop on this machine for the duration
+          # of the job; the "Restore machine autostop setting" step at the
+          # end (which always runs) puts it back to the fly.toml default.
+          flyctl machine update "$machine_id" \
+            --app vinyl-catalog \
+            --autostop=off \
+            --skip-health-checks \
+            --yes
+
           if [ "$machine_state" != "started" ]; then
             flyctl machine start "$machine_id" --app vinyl-catalog
           fi
@@ -138,6 +156,23 @@ jobs:
           if [ "$exit_code" != "0" ]; then
             echo "refresh_all.py exited with code $exit_code"
             exit 1
+          fi
+
+      - name: Restore machine autostop setting
+        if: always()
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_WEB }}
+        run: |
+          # Always runs (success, failure, or cancellation) so the machine
+          # never gets stuck with autostop disabled -- put it back to the
+          # fly.toml default ('stop') once the job is done with it.
+          machine_id="${{ steps.start_machine.outputs.machine_id }}"
+          if [ -n "$machine_id" ]; then
+            flyctl machine update "$machine_id" \
+              --app vinyl-catalog \
+              --autostop=stop \
+              --skip-health-checks \
+              --yes || echo "Failed to restore autostop setting on $machine_id -- check manually."
           fi
 
       - name: Notify on failure
